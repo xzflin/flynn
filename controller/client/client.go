@@ -42,6 +42,7 @@ type Client interface {
 	PutResource(resource *ct.Resource) error
 	DeleteResource(providerID, resourceID string) (*ct.Resource, error)
 	PutFormation(formation *ct.Formation) error
+	PutFormationComplete(formation *ct.Formation) error
 	PutJob(job *ct.Job) error
 	DeleteJob(appID, jobID string) error
 	SetAppRelease(appID, releaseID string) error

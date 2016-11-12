@@ -52,6 +52,7 @@ var preparedStatements = map[string]string{
 	"formation_insert":                      formationInsertQuery,
 	"formation_delete":                      formationDeleteQuery,
 	"formation_delete_by_app":               formationDeleteByAppQuery,
+	"formation_mark_complete":               formationMarkCompleteQuery,
 	"job_list":                              jobListQuery,
 	"job_list_active":                       jobListActiveQuery,
 	"job_select":                            jobSelectQuery,
@@ -226,10 +227,10 @@ VALUES ($1, $2, $3, $4)`
 INSERT INTO events (app_id, object_id, unique_id, object_type, data)
 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (unique_id) DO NOTHING`
 	formationListByAppQuery = `
-SELECT app_id, release_id, processes, tags, created_at, updated_at
+SELECT app_id, release_id, processes, tags, state, created_at, updated_at
 FROM formations WHERE app_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`
 	formationListByReleaseQuery = `
-SELECT app_id, release_id, processes, tags, created_at, updated_at
+SELECT app_id, release_id, processes, tags, state, created_at, updated_at
 FROM formations WHERE release_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`
 	formationListActiveQuery = `
 SELECT
@@ -243,7 +244,8 @@ SELECT
 	ORDER BY r.index
   ),
   releases.meta, releases.env, releases.processes, releases.created_at,
-  formations.processes, formations.tags, formations.updated_at, formations.deleted_at IS NOT NULL
+  formations.processes, formations.tags, formations.state,
+  formations.updated_at, formations.deleted_at IS NOT NULL
 FROM formations
 JOIN apps USING (app_id)
 JOIN releases ON releases.release_id = formations.release_id
@@ -268,14 +270,15 @@ SELECT
 	ORDER BY r.index
   ),
   releases.meta, releases.env, releases.processes, releases.created_at,
-  formations.processes, formations.tags, formations.updated_at, formations.deleted_at IS NOT NULL
+  formations.processes, formations.tags, formations.state,
+  formations.updated_at, formations.deleted_at IS NOT NULL
 FROM formations
 JOIN apps USING (app_id)
 JOIN releases ON releases.release_id = formations.release_id
 WHERE formations.updated_at >= $1 AND formations.deleted_at IS NULL
 ORDER BY formations.updated_at DESC`
 	formationSelectQuery = `
-SELECT app_id, release_id, processes, tags, created_at, updated_at
+SELECT app_id, release_id, processes, tags, state, created_at, updated_at
 FROM formations WHERE app_id = $1 AND release_id = $2 AND deleted_at IS NULL`
 	formationSelectExpandedQuery = `
 SELECT
@@ -289,23 +292,28 @@ SELECT
 	ORDER BY a.index
   ),
   releases.meta, releases.env, releases.processes, releases.created_at,
-  formations.processes, formations.tags, formations.updated_at, formations.deleted_at IS NOT NULL
+  formations.processes, formations.tags, formations.state,
+  formations.updated_at, formations.deleted_at IS NOT NULL
 FROM formations
 JOIN apps USING (app_id)
 JOIN releases ON releases.release_id = formations.release_id
 WHERE formations.app_id = $1 AND formations.release_id = $2`
 	formationInsertQuery = `
-INSERT INTO formations (app_id, release_id, processes, tags)
-VALUES ($1, $2, $3, $4)
+INSERT INTO formations (app_id, release_id, processes, tags, state)
+VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT ON CONSTRAINT formations_pkey DO UPDATE
-SET processes = $3, tags = $4, updated_at = now(), deleted_at = NULL
+SET processes = $3, tags = $4, state = $5, updated_at = now(), deleted_at = NULL
 RETURNING created_at, updated_at`
 	formationDeleteQuery = `
-UPDATE formations SET deleted_at = now(), processes = NULL, updated_at = now()
+UPDATE formations SET deleted_at = now(), processes = NULL, state = 'pending', updated_at = now()
 WHERE app_id = $1 AND release_id = $2 AND deleted_at IS NULL`
 	formationDeleteByAppQuery = `
-UPDATE formations SET deleted_at = now(), processes = NULL, updated_at = now()
+UPDATE formations SET deleted_at = now(), processes = NULL, state = 'pending', updated_at = now()
 WHERE app_id = $1 AND deleted_at IS NULL`
+	formationMarkCompleteQuery = `
+UPDATE formations SET state = 'complete', updated_at = now()
+WHERE app_id = $1 AND release_id = $2 AND updated_at = $3
+RETURNING processes`
 	jobListQuery = `
 SELECT cluster_id, job_id, host_id, app_id, release_id, process_type, state, meta, exit_status, host_error, run_at, restarts, created_at, updated_at, args
 FROM job_cache WHERE app_id = $1 ORDER BY created_at DESC`

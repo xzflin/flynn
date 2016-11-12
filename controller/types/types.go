@@ -26,6 +26,7 @@ type ExpandedFormation struct {
 	Artifacts []*Artifact                  `json:"artifacts,omitempty"`
 	Processes map[string]int               `json:"processes,omitempty"`
 	Tags      map[string]map[string]string `json:"tags,omitempty"`
+	State     FormationState               `json:"state,omitempty"`
 	UpdatedAt time.Time                    `json:"updated_at,omitempty"`
 	Deleted   bool                         `json:"deleted,omitempty"`
 
@@ -173,10 +174,18 @@ type Formation struct {
 	AppID     string                       `json:"app,omitempty"`
 	ReleaseID string                       `json:"release,omitempty"`
 	Processes map[string]int               `json:"processes,omitempty"`
+	State     FormationState               `json:"state,omitempty"`
 	Tags      map[string]map[string]string `json:"tags,omitempty"`
 	CreatedAt *time.Time                   `json:"created_at,omitempty"`
 	UpdatedAt *time.Time                   `json:"updated_at,omitempty"`
 }
+
+type FormationState string
+
+const (
+	FormationStatePending  FormationState = "pending"
+	FormationStateComplete FormationState = "complete"
+)
 
 type Job struct {
 	// ID is the job's full cluster ID (i.e. hostID-UUID) and can be empty
@@ -419,6 +428,7 @@ type Scale struct {
 	PrevProcesses map[string]int `json:"prev_processes,omitempty"`
 	Processes     map[string]int `json:"processes"`
 	ReleaseID     string         `json:"release"`
+	State         FormationState `json:"state"`
 }
 
 type AppRelease struct {

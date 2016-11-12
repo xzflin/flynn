@@ -266,6 +266,7 @@ func appHandler(c handlerConfig) http.Handler {
 	httpRouter.POST("/apps/:apps_id/gc", httphelper.WrapHandler(api.appLookup(api.ScheduleAppGarbageCollection)))
 
 	httpRouter.PUT("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.PutFormation)))
+	httpRouter.PUT("/apps/:apps_id/formations/:releases_id/complete", httphelper.WrapHandler(api.appLookup(api.PutFormationComplete)))
 	httpRouter.GET("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.GetFormation)))
 	httpRouter.DELETE("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.DeleteFormation)))
 	httpRouter.GET("/apps/:apps_id/formations", httphelper.WrapHandler(api.appLookup(api.ListFormations)))

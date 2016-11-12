@@ -436,6 +436,12 @@ $$ LANGUAGE plpgsql`,
 		$$ LANGUAGE plpgsql`,
 		`CREATE TRIGGER check_artifact_manifest AFTER INSERT ON artifacts FOR EACH ROW EXECUTE PROCEDURE check_artifact_manifest()`,
 	)
+	migrations.Add(27,
+		`CREATE TABLE formation_states (name text PRIMARY KEY)`,
+		`INSERT INTO formation_states (name) VALUES ('pending'), ('complete')`,
+		`ALTER TABLE formations ADD COLUMN state text DEFAULT 'pending'`,
+		`ALTER TABLE formations ADD CONSTRAINT formations_state_fkey FOREIGN KEY (state) REFERENCES formation_states (name)`,
+	)
 }
 
 func migrateDB(db *postgres.DB) error {

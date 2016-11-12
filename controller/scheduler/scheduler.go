@@ -75,7 +75,7 @@ type Scheduler struct {
 	routerServiceEvents   chan *discoverd.Event
 	routerStreamEvents    chan *RouterEvent
 	formationEvents       chan *ct.ExpandedFormation
-	putJobs               chan *ct.Job
+	controllerPersist     chan interface{}
 	placementRequests     chan *PlacementRequest
 	internalStateRequests chan *InternalStateRequest
 
@@ -131,7 +131,7 @@ func NewScheduler(cluster utils.ClusterClient, cc utils.ControllerClient, disc D
 		serviceEvents:         make(chan *discoverd.Event, eventBufferSize),
 		routerServiceEvents:   make(chan *discoverd.Event, eventBufferSize),
 		routerStreamEvents:    make(chan *RouterEvent, eventBufferSize),
-		putJobs:               make(chan *ct.Job, eventBufferSize),
+		controllerPersist:     make(chan interface{}, eventBufferSize),
 		placementRequests:     make(chan *PlacementRequest, eventBufferSize),
 		internalStateRequests: make(chan *InternalStateRequest, eventBufferSize),
 		formationlessJobs:     make(map[utils.FormationKey]map[string]*Job),
@@ -329,7 +329,7 @@ func (s *Scheduler) Run() error {
 	log.Info("starting scheduler loop")
 	defer log.Info("scheduler loop exited")
 
-	go s.RunPutJobs()
+	go s.ControllerPersistLoop()
 
 	// stream host events (which will start watching job events on
 	// all current hosts before returning) *before* registering in
@@ -361,7 +361,7 @@ func (s *Scheduler) Run() error {
 		select {
 		case <-s.stop:
 			log.Info("stopping scheduler loop")
-			close(s.putJobs)
+			close(s.controllerPersist)
 			return nil
 		case isLeader := <-leaderCh:
 			s.HandleLeaderChange(isLeader)
@@ -419,7 +419,7 @@ func (s *Scheduler) Run() error {
 			s.HandleRectify()
 		case <-s.stop:
 			log.Info("stopping scheduler loop")
-			close(s.putJobs)
+			close(s.controllerPersist)
 			return nil
 		case isLeader := <-leaderCh:
 			s.HandleLeaderChange(isLeader)
@@ -658,11 +658,41 @@ func (s *Scheduler) RectifyFormation(key utils.FormationKey) {
 	// them on hosts with matching tags
 	s.stopJobsWithMismatchedTags(formation)
 
+	// mark the formation as complete if it has the correct number of
+	// running jobs
+	if formation.State != ct.FormationStateComplete {
+		running := make(Processes)
+		for _, job := range s.jobs {
+			if job.IsInFormation(key) && job.State == JobStateRunning {
+				running[job.Type]++
+			}
+		}
+		if running.Equals(formation.GetProcesses()) {
+			s.markFormationAsComplete(formation)
+		}
+	}
+
 	diff := s.formationDiff(formation)
 	if diff.IsEmpty() {
 		return
 	}
 	s.handleFormationDiff(formation, diff)
+}
+
+var putFormationAttempts = attempt.Strategy{
+	Delay: 100 * time.Millisecond,
+	Total: time.Minute,
+}
+
+func (s *Scheduler) markFormationAsComplete(f *Formation) {
+	s.logger.Info("marking formation as complete", "app.id", f.App.ID, "release.id", f.Release.ID, "updated", f.UpdatedAt)
+	f.State = ct.FormationStateComplete
+	s.controllerPersist <- &ct.Formation{
+		AppID:     f.App.ID,
+		ReleaseID: f.Release.ID,
+		State:     ct.FormationStateComplete,
+		UpdatedAt: &f.UpdatedAt,
+	}
 }
 
 // stopSurplusOmniJobs stops surplus jobs which are running on a host which has
@@ -939,20 +969,23 @@ func (s *Scheduler) ShuffledHosts() []*Host {
 	return hosts
 }
 
-var putJobAttempts = attempt.Strategy{
+var controllerPersistAttempts = attempt.Strategy{
 	Delay: 100 * time.Millisecond,
 	Total: time.Minute,
 }
 
-// RunPutJobs starts a loop which receives jobs from the s.putJobs channel and
-// persists them to the controller using the putJobAttempts retry strategy.
+// ControllerPersistLoop starts a loop which receives jobs and formations from
+// the s.controllerPersist channel and persists them to the controller using
+// the controllerPersistAttempts retry strategy.
 //
-// A goroutine is started per job to persist, but care is taken to persist jobs
-// with the same UUID sequentially and in order to avoid for example a job
-// transitioning from "down" to "up" in the controller.
-func (s *Scheduler) RunPutJobs() {
-	log := s.logger.New("fn", "RunPutJobs")
-	log.Info("starting job persistence loop")
+// A goroutine is started per job and formation to persist, but care is taken
+// to persist jobs with the same UUID sequentially and in order (to avoid for
+// example a job transitioning from "down" to "up" in the controller) and
+// formations after associated jobs (so that scale events are emitted after
+// job events).
+func (s *Scheduler) ControllerPersistLoop() {
+	log := s.logger.New("fn", "ControllerPersistLoop")
+	log.Info("starting controller persistence loop")
 
 	// queue is a map of job UUID to a slice of jobs to persist for that
 	// given UUID, and the loop below persists the jobs in the slice
@@ -964,10 +997,14 @@ func (s *Scheduler) RunPutJobs() {
 	// persistence of the next job in the queue for that UUID
 	done := make(chan string)
 
-	// persist makes multiple attempts to persist the given job, sending to
-	// the done channel once the attempts have finished
-	persist := func(job *ct.Job) {
-		err := putJobAttempts.RunWithValidator(func() error {
+	// formations is a queue of formations waiting to be persisted after
+	// the associated job events
+	formations := make(map[utils.FormationKey]*ct.Formation)
+
+	// persistJob makes multiple attempts to persist the given job, sending
+	// to the done channel once the attempts have finished
+	persistJob := func(job *ct.Job) {
+		err := controllerPersistAttempts.RunWithValidator(func() error {
 			return s.PutJob(job)
 		}, httphelper.IsRetryableError)
 		if err != nil {
@@ -976,23 +1013,56 @@ func (s *Scheduler) RunPutJobs() {
 		done <- job.UUID
 	}
 
-	// start the persistence loop which receives from both the s.putJobs
-	// and the done channel, modifies the queue accordingly and then calls
-	// the persist function in a goroutine if necessary
+	maybePersistFormation := func(f *ct.Formation) {
+		key := utils.FormationKey{f.AppID, f.ReleaseID}
+
+		// if there are any associated jobs being persisted, add to the
+		// formations queue to be persisted later (to avoid scale
+		// events preceeding job events)
+		for _, jobs := range queue {
+			for _, job := range jobs {
+				if job.AppID == f.AppID && job.ReleaseID == f.ReleaseID {
+					formations[key] = f
+					return
+				}
+			}
+		}
+
+		go func() {
+			err := controllerPersistAttempts.RunWithValidator(func() error {
+				return s.PutFormationComplete(f)
+			}, httphelper.IsRetryableError)
+			if err != nil {
+				log.Error("error marking formation as complete",
+					"app.id", f.AppID, "release.id", f.ReleaseID, "updated", f.UpdatedAt, "err", err)
+			}
+		}()
+		delete(formations, key)
+	}
+
+	// start the persistence loop which receives from both the
+	// s.controllerPersist and the done channel, modifies the
+	// queue accordingly and then calls the persist functions
+	// if necessary
 	for {
 		select {
-		case job, ok := <-s.putJobs:
+		case v, ok := <-s.controllerPersist:
 			if !ok {
-				log.Info("stopping job persistence loop")
+				log.Info("stopping controller persistence loop")
 				return
 			}
 
-			// push the job to the back of the queue
-			queue[job.UUID] = append(queue[job.UUID], job)
+			switch v := v.(type) {
+			case *ct.Job:
+				// push the job to the back of the queue
+				queue[v.UUID] = append(queue[v.UUID], v)
 
-			// if there is only one job in the queue, persist it
-			if len(queue[job.UUID]) == 1 {
-				go persist(job)
+				// if there is only one job in the queue, persist it
+				if len(queue[v.UUID]) == 1 {
+					go persistJob(v)
+				}
+			case *ct.Formation:
+				maybePersistFormation(v)
 			}
 		case uuid := <-done:
 			// remove the persisted job from the queue
@@ -1000,9 +1070,14 @@ func (s *Scheduler) RunPutJobs() {
 
 			// if the queue has more jobs, persist the first one
 			if len(queue[uuid]) > 0 {
-				go persist(queue[uuid][0])
+				go persistJob(queue[uuid][0])
 			} else {
 				delete(queue, uuid)
+			}
+
+			// try and persist formations
+			for _, f := range formations {
+				maybePersistFormation(f)
 			}
 		}
 	}
@@ -1654,18 +1729,19 @@ func (s *Scheduler) persistJob(job *Job) {
 	s.persistControllerJob(job.ControllerJob())
 }
 
-// persistControllerJob triggers the RunPutJobs goroutine to persist the job to
-// the controller, but only if the scheduler either doesn't know the current
-// leader (e.g. if this is the first scheduler to start) or it itself is the
-// current leader to avoid states jumping back and forward in the database
+// persistControllerJob triggers the ControllerPersistLoop goroutine to persist
+// the job to the controller, but only if the scheduler either doesn't know the
+// current leader (e.g. if this is the first scheduler to start) or it itself
+// is the current leader to avoid states jumping back and forward in the
+// database
 func (s *Scheduler) persistControllerJob(job *ct.Job) {
 	if s.isLeader == nil || *s.isLeader {
-		s.putJobs <- job
+		s.controllerPersist <- job
 	}
 }
 
 func (s *Scheduler) handleFormation(ef *ct.ExpandedFormation) (formation *Formation) {
-	log := s.logger.New("fn", "handleFormation", "app.id", ef.App.ID, "release.id", ef.Release.ID)
+	log := s.logger.New("fn", "handleFormation", "app.id", ef.App.ID, "release.id", ef.Release.ID, "state", ef.State, "updated", ef.UpdatedAt)
 
 	defer func() {
 		// subscribe to any release services so we know when to mark
@@ -1694,6 +1770,10 @@ func (s *Scheduler) handleFormation(ef *ct.ExpandedFormation) (formation *Format
 			}
 		}
 
+		if formation.State == ct.FormationStatePending {
+			s.triggerRectify(formation.key())
+		}
+
 		// ensure the formation has the correct omni job counts
 		if formation.RectifyOmni(s.activeHostCount()) {
 			s.triggerRectify(formation.key())
@@ -1720,6 +1800,7 @@ func (s *Scheduler) handleFormation(ef *ct.ExpandedFormation) (formation *Format
 			return
 		}
 		formation.UpdatedAt = ef.UpdatedAt
+		formation.State = ef.State
 
 		diff := Processes(ef.Processes).Diff(formation.OriginalProcesses)
 		if diff.IsEmpty() && utils.FormationTagsEqual(formation.Tags, ef.Tags) {

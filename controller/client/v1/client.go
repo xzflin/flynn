@@ -287,6 +287,15 @@ func (c *Client) PutFormation(formation *ct.Formation) error {
 	return c.Put(fmt.Sprintf("/apps/%s/formations/%s", formation.AppID, formation.ReleaseID), formation, formation)
 }
 
+// PutFormationComplete marks a formation as complete.
+func (c *Client) PutFormationComplete(formation *ct.Formation) error {
+	if formation.AppID == "" || formation.ReleaseID == "" {
+		return errors.New("controller: missing app id and/or release id")
+	}
+	formation.State = ct.FormationStateComplete
+	return c.Put(fmt.Sprintf("/apps/%s/formations/%s/complete", formation.AppID, formation.ReleaseID), formation, formation)
+}
+
 // PutJob updates an existing job.
 func (c *Client) PutJob(job *ct.Job) error {
 	if job.UUID == "" || job.AppID == "" {

@@ -30,6 +30,11 @@
       "description": "process tags",
       "type": "object"
     },
+    "state": {
+      "description": "formation state",
+      "type": "string",
+      "enum": ["pending", "complete"]
+    },
     "created_at": {
       "$ref": "/schema/controller/common#/definitions/created_at"
     },

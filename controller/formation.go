@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -55,9 +56,16 @@ func (r *FormationRepo) Add(f *ct.Formation) error {
 	if err := r.validateFormProcs(f); err != nil {
 		return err
 	}
+
+	// mark the formation as pending so that clients can then wait for the
+	// scheduler to mark it as complete when the appropriate number of jobs
+	// are running (which may be straight away if nothing has changed)
+	f.State = ct.FormationStatePending
+
 	scale := &ct.Scale{
 		Processes: f.Processes,
 		ReleaseID: f.ReleaseID,
+		State:     f.State,
 	}
 	prevFormation, _ := r.Get(f.AppID, f.ReleaseID)
 	if prevFormation != nil {
@@ -67,7 +75,7 @@ func (r *FormationRepo) Add(f *ct.Formation) error {
 	if err != nil {
 		return err
 	}
-	err = tx.QueryRow("formation_insert", f.AppID, f.ReleaseID, f.Processes, f.Tags).Scan(&f.CreatedAt, &f.UpdatedAt)
+	err = tx.QueryRow("formation_insert", f.AppID, f.ReleaseID, f.Processes, f.Tags, string(f.State)).Scan(&f.CreatedAt, &f.UpdatedAt)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -98,13 +106,15 @@ func scanFormations(rows *pgx.Rows) ([]*ct.Formation, error) {
 
 func scanFormation(s postgres.Scanner) (*ct.Formation, error) {
 	f := &ct.Formation{}
-	err := s.Scan(&f.AppID, &f.ReleaseID, &f.Processes, &f.Tags, &f.CreatedAt, &f.UpdatedAt)
+	var state string
+	err := s.Scan(&f.AppID, &f.ReleaseID, &f.Processes, &f.Tags, &state, &f.CreatedAt, &f.UpdatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			err = ErrNotFound
 		}
 		return nil, err
 	}
+	f.State = ct.FormationState(state)
 	return f, err
 }
 
@@ -115,6 +125,7 @@ func scanExpandedFormation(s postgres.Scanner) (*ct.ExpandedFormation, error) {
 	}
 	var artifactIDs string
 	var appReleaseID *string
+	var state string
 	err := s.Scan(
 		&f.App.ID,
 		&f.App.Name,
@@ -132,6 +143,7 @@ func scanExpandedFormation(s postgres.Scanner) (*ct.ExpandedFormation, error) {
 		&f.Release.CreatedAt,
 		&f.Processes,
 		&f.Tags,
+		&state,
 		&f.UpdatedAt,
 		&f.Deleted,
 	)
@@ -154,6 +166,7 @@ func scanExpandedFormation(s postgres.Scanner) (*ct.ExpandedFormation, error) {
 			f.Release.LegacyArtifactID = f.Release.ArtifactIDs[0]
 		}
 	}
+	f.State = ct.FormationState(state)
 	return f, nil
 }
 
@@ -252,6 +265,7 @@ func (r *FormationRepo) listExpanded(rows *pgx.Rows) ([]*ct.ExpandedFormation, e
 func (r *FormationRepo) Remove(appID, releaseID string) error {
 	scale := &ct.Scale{
 		ReleaseID: releaseID,
+		State:     ct.FormationStatePending,
 	}
 	prevFormation, _ := r.Get(appID, releaseID)
 	if prevFormation != nil {
@@ -269,6 +283,36 @@ func (r *FormationRepo) Remove(appID, releaseID string) error {
 	if err := createEvent(tx.Exec, &ct.Event{
 		AppID:      appID,
 		ObjectID:   appID + ":" + releaseID,
+		ObjectType: ct.EventTypeScale,
+	}, scale); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+var ErrFormationConflict = errors.New("controller: the formation's updated_at did not match the provided updated_at")
+
+func (r *FormationRepo) MarkComplete(f *ct.Formation) error {
+	scale := &ct.Scale{
+		ReleaseID: f.ReleaseID,
+		State:     ct.FormationStateComplete,
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	err = tx.QueryRow("formation_mark_complete", f.AppID, f.ReleaseID, f.UpdatedAt).Scan(&scale.Processes)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			err = ErrFormationConflict
+		}
+		tx.Rollback()
+		return err
+	}
+	if err := createEvent(tx.Exec, &ct.Event{
+		AppID:      f.AppID,
+		ObjectID:   f.AppID + ":" + f.ReleaseID,
 		ObjectType: ct.EventTypeScale,
 	}, scale); err != nil {
 		tx.Rollback()
@@ -305,6 +349,29 @@ func (c *controllerAPI) PutFormation(ctx context.Context, w http.ResponseWriter,
 	}
 
 	if err = c.formationRepo.Add(&formation); err != nil {
+		respondWithError(w, err)
+		return
+	}
+	httphelper.JSON(w, 200, &formation)
+}
+
+func (c *controllerAPI) PutFormationComplete(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	var formation ct.Formation
+	if err := httphelper.DecodeJSON(req, &formation); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	if err := schema.Validate(formation); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	if err := c.formationRepo.MarkComplete(&formation); err != nil {
+		if err == ErrFormationConflict {
+			httphelper.ConflictError(w, err.Error())
+			return
+		}
 		respondWithError(w, err)
 		return
 	}
