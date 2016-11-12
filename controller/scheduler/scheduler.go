@@ -28,9 +28,10 @@ import (
 )
 
 const (
-	eventBufferSize      = 1000
-	defaultMaxHostChecks = 10
-	routerDrainTimeout   = 10 * time.Second
+	eventBufferSize        = 1000
+	defaultMaxHostChecks   = 10
+	routerDrainTimeout     = 10 * time.Second
+	routerBackendUpTimeout = 10 * time.Second
 )
 
 var (
@@ -55,6 +56,8 @@ type Scheduler struct {
 	hosts      map[string]*Host
 	routers    map[string]*Router
 	jobs       Jobs
+	routes     map[string]map[string]struct{}
+	services   map[string]*Service
 
 	jobEvents chan *host.Event
 
@@ -68,8 +71,9 @@ type Scheduler struct {
 	rectify               chan struct{}
 	sendTelemetry         chan struct{}
 	hostEvents            chan *discoverd.Event
+	serviceEvents         chan *discoverd.Event
 	routerServiceEvents   chan *discoverd.Event
-	routerBackendEvents   chan *RouterEvent
+	routerStreamEvents    chan *RouterEvent
 	formationEvents       chan *ct.ExpandedFormation
 	putJobs               chan *ct.Job
 	placementRequests     chan *PlacementRequest
@@ -110,6 +114,8 @@ func NewScheduler(cluster utils.ClusterClient, cc utils.ControllerClient, disc D
 		hosts:                 make(map[string]*Host),
 		routers:               make(map[string]*Router),
 		jobs:                  make(map[string]*Job),
+		services:              make(map[string]*Service),
+		routes:                make(map[string]map[string]struct{}),
 		formations:            make(Formations),
 		jobEvents:             make(chan *host.Event, eventBufferSize),
 		stop:                  make(chan struct{}),
@@ -122,8 +128,9 @@ func NewScheduler(cluster utils.ClusterClient, cc utils.ControllerClient, disc D
 		sendTelemetry:         make(chan struct{}, 1),
 		formationEvents:       make(chan *ct.ExpandedFormation, eventBufferSize),
 		hostEvents:            make(chan *discoverd.Event, eventBufferSize),
+		serviceEvents:         make(chan *discoverd.Event, eventBufferSize),
 		routerServiceEvents:   make(chan *discoverd.Event, eventBufferSize),
-		routerBackendEvents:   make(chan *RouterEvent, eventBufferSize),
+		routerStreamEvents:    make(chan *RouterEvent, eventBufferSize),
 		putJobs:               make(chan *ct.Job, eventBufferSize),
 		placementRequests:     make(chan *PlacementRequest, eventBufferSize),
 		internalStateRequests: make(chan *InternalStateRequest, eventBufferSize),
@@ -370,11 +377,14 @@ func (s *Scheduler) Run() error {
 		case e := <-s.hostEvents:
 			s.HandleHostEvent(e)
 			continue
+		case e := <-s.serviceEvents:
+			s.HandleServiceEvent(e)
+			continue
 		case e := <-s.routerServiceEvents:
 			s.HandleRouterServiceEvent(e)
 			continue
-		case e := <-s.routerBackendEvents:
-			s.HandleRouterBackendEvent(e)
+		case e := <-s.routerStreamEvents:
+			s.HandleRouterStreamEvent(e)
 			continue
 		case <-s.hostChecks:
 			s.PerformHostChecks()
@@ -419,10 +429,12 @@ func (s *Scheduler) Run() error {
 			s.HandleInternalStateRequest(req)
 		case e := <-s.hostEvents:
 			s.HandleHostEvent(e)
+		case e := <-s.serviceEvents:
+			s.HandleServiceEvent(e)
 		case e := <-s.routerServiceEvents:
 			s.HandleRouterServiceEvent(e)
-		case e := <-s.routerBackendEvents:
-			s.HandleRouterBackendEvent(e)
+		case e := <-s.routerStreamEvents:
+			s.HandleRouterStreamEvent(e)
 		case <-s.hostChecks:
 			s.PerformHostChecks()
 		case e := <-s.jobEvents:
@@ -1246,13 +1258,76 @@ func (s *Scheduler) HandleHostEvent(e *discoverd.Event) {
 	}
 }
 
+func (s *Scheduler) HandleServiceEvent(e *discoverd.Event) {
+	if e.Instance == nil {
+		return
+	}
+
+	jobID := e.Instance.Meta["FLYNN_JOB_ID"]
+	jobType := e.Instance.Meta["FLYNN_PROCESS_TYPE"]
+	log := s.logger.New("fn", "HandleServiceEvent", "service", e.Service, "kind", e.Kind, "job.id", jobID, "job.type", jobType)
+	log.Info("handling service event")
+
+	id, err := cluster.ExtractUUID(jobID)
+	if err != nil {
+		log.Error("error handling service event, invalid job ID")
+		return
+	}
+
+	job, ok := s.jobs[id]
+	if !ok {
+		log.Error("error handling service event, unknown job")
+		return
+	}
+
+	if job.serviceFirstSeen == nil {
+		now := time.Now()
+		job.serviceFirstSeen = &now
+	}
+
+	if job.State != JobStatePending && job.State != JobStateStarting {
+		return
+	}
+
+	shouldWaitForRouterBackends := func() bool {
+		// don't wait if there are no routes for the service
+		routes, ok := s.routes[job.Service()]
+		if !ok {
+			return false
+		}
+
+		// don't wait if the service was first seen more than
+		// routerBackendUpTimeout ago
+		if time.Since(*job.serviceFirstSeen) > routerBackendUpTimeout {
+			return false
+		}
+
+		// don't wait if the job is up in all the routers which
+		// have a route for the service
+		if backend, ok := s.routerBackends[jobID]; ok && len(backend.Routers) >= len(routes) {
+			return false
+		}
+
+		return true
+	}
+
+	if shouldWaitForRouterBackends() {
+		log.Info("waiting for router backend events")
+		time.AfterFunc(routerBackendUpTimeout, func() {
+			s.serviceEvents <- e
+		})
+	} else {
+		s.handleJobStatus(job, host.StatusRunning)
+	}
+}
+
 func (s *Scheduler) HandleRouterServiceEvent(e *discoverd.Event) {
 	switch e.Kind {
 	case discoverd.EventKindUp, discoverd.EventKindUpdate:
 		id := e.Instance.Meta["FLYNN_JOB_ID"]
 		if _, ok := s.routers[id]; !ok {
 			s.logger.Info("adding router", "router.id", id)
-			s.routers[id] = NewRouter(id, e.Instance.Addr, s.routerBackendEvents, s.logger)
+			s.routers[id] = NewRouter(id, e.Instance.Addr, s.routerStreamEvents, s.logger)
 		}
 	case discoverd.EventKindDown:
 		id := e.Instance.Meta["FLYNN_JOB_ID"]
@@ -1262,7 +1337,7 @@ func (s *Scheduler) HandleRouterServiceEvent(e *discoverd.Event) {
 			delete(s.routers, id)
 		}
 		for _, b := range s.routerBackends {
-			s.HandleRouterBackendEvent(&RouterEvent{
+			s.HandleRouterStreamEvent(&RouterEvent{
 				RouterID: id,
 				Type:     router.EventTypeBackendDrained,
 				Backend:  b.Backend,
@@ -1271,10 +1346,34 @@ func (s *Scheduler) HandleRouterServiceEvent(e *discoverd.Event) {
 	}
 }
 
-func (s *Scheduler) HandleRouterBackendEvent(e *RouterEvent) {
-	log := s.logger.New("job.id", e.Backend.JobID, "job.service", e.Backend.Service, "router.id", e.RouterID)
+func (s *Scheduler) HandleRouterStreamEvent(e *RouterEvent) {
+	log := s.logger.New("router.id", e.RouterID)
+	if e.Backend != nil {
+		log = log.New("job.id", e.Backend.JobID, "job.service", e.Backend.Service)
+	}
+	if e.Route != nil {
+		log = log.New("route.service", e.Route.Service)
+	}
 
 	switch e.Type {
+	case router.EventTypeRouteSet:
+		routes, ok := s.routes[e.Route.Service]
+		if !ok {
+			routes = make(map[string]struct{})
+			s.routes[e.Route.Service] = routes
+		}
+		routes[e.RouterID] = struct{}{}
+		log.Info("route added", "router.count", len(routes))
+	case router.EventTypeRouteRemove:
+		routes, ok := s.routes[e.Route.Service]
+		if !ok {
+			return
+		}
+		delete(routes, e.RouterID)
+		log.Info("route removed", "router.count", len(routes))
+		if len(routes) == 0 {
+			delete(s.routes, e.Route.Service)
+		}
 	case router.EventTypeBackendUp:
 		backend, ok := s.routerBackends[e.Backend.JobID]
 		if !ok {
@@ -1283,6 +1382,12 @@ func (s *Scheduler) HandleRouterBackendEvent(e *RouterEvent) {
 		}
 		backend.Routers[e.RouterID] = struct{}{}
 		log.Info("router backend is up", "router.count", len(backend.Routers))
+
+		// if the backend is up in all the routers which have a route
+		// for the service, mark it as running
+		if len(backend.Routers) >= len(s.routes[e.Backend.Service]) {
+			s.markRouterBackendUp(backend)
+		}
 	case router.EventTypeBackendDrained:
 		backend, ok := s.routerBackends[e.Backend.JobID]
 		if !ok {
@@ -1294,6 +1399,20 @@ func (s *Scheduler) HandleRouterBackendEvent(e *RouterEvent) {
 			close(backend.Drained)
 			delete(s.routerBackends, e.Backend.JobID)
 		}
+	}
+}
+
+func (s *Scheduler) markRouterBackendUp(b *RouterBackend) {
+	id, err := cluster.ExtractUUID(b.Backend.JobID)
+	if err != nil {
+		return
+	}
+	job, ok := s.jobs[id]
+	if !ok {
+		return
+	}
+	if job.State == JobStatePending || job.State == JobStateStarting {
+		s.handleJobStatus(job, host.StatusRunning)
 	}
 }
 
@@ -1437,6 +1556,14 @@ func (s *Scheduler) handleActiveJob(activeJob *host.ActiveJob) *Job {
 	job.exitStatus = activeJob.ExitStatus
 	job.hostError = activeJob.Error
 
+	// if the host job is running but has a service, wait for either
+	// service or router events before marking the job as running
+	if activeJob.Status == host.StatusRunning && job.Service() != "" {
+		// TODO: consider adding a hard timeout to mark the job
+		//	 as running in case we never get any events
+		return job
+	}
+
 	s.handleJobStatus(job, activeJob.Status)
 
 	return job
@@ -1541,6 +1668,32 @@ func (s *Scheduler) handleFormation(ef *ct.ExpandedFormation) (formation *Format
 	log := s.logger.New("fn", "handleFormation", "app.id", ef.App.ID, "release.id", ef.Release.ID)
 
 	defer func() {
+		// subscribe to any release services so we know when to mark
+		// service jobs as running
+		processes := Processes(ef.Processes)
+		for _, proc := range ef.Release.Processes {
+			if proc.Service == "" {
+				continue
+			}
+			service, ok := s.services[proc.Service]
+			if !ok {
+				if processes.IsEmpty() {
+					continue
+				}
+				service = NewService(proc.Service, s.serviceEvents, s.logger)
+				s.services[proc.Service] = service
+			}
+			if processes.IsEmpty() {
+				delete(service.Formations, formation.key())
+				if len(service.Formations) == 0 {
+					service.Close()
+					delete(s.services, proc.Service)
+				}
+			} else {
+				service.Formations[formation.key()] = struct{}{}
+			}
+		}
+
 		// ensure the formation has the correct omni job counts
 		if formation.RectifyOmni(s.activeHostCount()) {
 			s.triggerRectify(formation.key())
