@@ -495,7 +495,8 @@
               "proto": "tcp",
               "service": {
                 "name": "gitreceive",
-                "create": true
+                "create": true,
+                "check": {"type": "tcp"}
               }
             }
           ],
@@ -700,7 +701,8 @@
             "proto": "tcp",
             "service": {
               "name": "status-web",
-              "create": true
+              "create": true,
+              "check": {"type": "tcp"}
             }
           }]
         }
