@@ -431,6 +431,11 @@ type Scale struct {
 	State         FormationState `json:"state"`
 }
 
+type ScaleOptions struct {
+	Timeout          *time.Duration
+	JobEventCallback func(*Job) error
+}
+
 type AppRelease struct {
 	PrevRelease *Release `json:"prev_release,omitempty"`
 	Release     *Release `json:"release"`

@@ -41,6 +41,7 @@ type Client interface {
 	AppResourceList(appID string) ([]*ct.Resource, error)
 	PutResource(resource *ct.Resource) error
 	DeleteResource(providerID, resourceID string) (*ct.Resource, error)
+	Scale(formation *ct.Formation, opts *ct.ScaleOptions) error
 	PutFormation(formation *ct.Formation) error
 	PutFormationComplete(formation *ct.Formation) error
 	PutJob(job *ct.Job) error

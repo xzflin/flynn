@@ -9,7 +9,6 @@ import (
 
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/controller/utils"
 	"github.com/flynn/go-docopt"
 )
 
@@ -58,8 +57,6 @@ Example:
 	scale completed in 3.944629056s
 `)
 }
-
-const scaleTimeout = 20 * time.Second
 
 // takes args of the form "web=1[,key=val...]", "worker=3[,key=val...]", etc
 func runScale(args *docopt.Args, client controller.Client) error {
@@ -154,17 +151,6 @@ func runScale(args *docopt.Args, client controller.Client) error {
 	formation.Processes = processes
 	formation.Tags = tags
 
-	if scalingComplete(currentProcs, processes) {
-		if !utils.FormationTagsEqual(currentTags, tags) {
-			// TODO: determine the effect of changing tags and wait
-			//       for appropriate events
-			fmt.Println("persisting tag change")
-			return client.PutFormation(formation)
-		}
-		fmt.Println("requested scale equals current scale, nothing to do!")
-		return nil
-	}
-
 	scale := make([]string, 0, len(release.Processes))
 	for typ := range release.Processes {
 		if currentProcs[typ] != processes[typ] {
@@ -173,28 +159,21 @@ func runScale(args *docopt.Args, client controller.Client) error {
 	}
 	fmt.Printf("scaling %s\n\n", strings.Join(scale, ", "))
 
-	expected := client.ExpectedScalingEvents(currentProcs, processes, release.Processes, 1)
-	watcher, err := client.WatchJobEvents(app, release.ID)
-	if err != nil {
-		return err
-	}
-	defer watcher.Close()
-
-	err = client.PutFormation(formation)
-	if err != nil || args.Bool["--no-wait"] {
-		return err
+	if args.Bool["--no-wait"] {
+		return client.PutFormation(formation)
 	}
 
 	start := time.Now()
-	err = watcher.WaitFor(expected, scaleTimeout, func(job *ct.Job) error {
-		id := job.ID
-		if id == "" {
-			id = job.UUID
-		}
-		fmt.Printf("%s ==> %s %s %s\n", time.Now().Format("15:04:05.000"), job.Type, id, job.State)
-		return nil
+	err = client.Scale(formation, &ct.ScaleOptions{
+		JobEventCallback: func(job *ct.Job) error {
+			id := job.ID
+			if id == "" {
+				id = job.UUID
+			}
+			fmt.Printf("%s ==> %s %s %s\n", time.Now().Format("15:04:05.000"), job.Type, id, job.State)
+			return nil
+		},
 	})
-
 	if err != nil {
 		return err
 	}

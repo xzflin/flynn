@@ -279,6 +279,70 @@ func (c *Client) DeleteResource(providerID, resourceID string) (*ct.Resource, er
 	return res, err
 }
 
+var DefaultScaleTimeout = 30 * time.Second
+
+func (c *Client) Scale(formation *ct.Formation, opts *ct.ScaleOptions) error {
+	if opts == nil {
+		opts = &ct.ScaleOptions{}
+	}
+	if opts.Timeout == nil {
+		opts.Timeout = &DefaultScaleTimeout
+	}
+
+	events := make(chan *ct.Event)
+	stream, err := c.StreamEvents(ct.StreamEventsOptions{
+		AppID: formation.AppID,
+		ObjectTypes: []ct.EventType{
+			ct.EventTypeJob,
+			ct.EventTypeScale,
+		},
+	}, events)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	if err = c.PutFormation(formation); err != nil {
+		return err
+	}
+
+	timeout := time.After(*opts.Timeout)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return fmt.Errorf("event stream closed unexpectedly: %s", stream.Err())
+			}
+			switch event.ObjectType {
+			case ct.EventTypeJob:
+				if opts.JobEventCallback == nil {
+					continue
+				}
+				var job ct.Job
+				if err := json.Unmarshal(event.Data, &job); err != nil {
+					continue
+				}
+				if job.ReleaseID != formation.ReleaseID {
+					continue
+				}
+				if err := opts.JobEventCallback(&job); err != nil {
+					return err
+				}
+			case ct.EventTypeScale:
+				var scale ct.Scale
+				if err := json.Unmarshal(event.Data, &scale); err != nil {
+					continue
+				}
+				if scale.ReleaseID == formation.ReleaseID && scale.State == ct.FormationStateComplete {
+					return nil
+				}
+			}
+		case <-timeout:
+			return fmt.Errorf("timed out waiting for scale to complete (waited %.f seconds)", opts.Timeout.Seconds())
+		}
+	}
+}
+
 // PutFormation updates an existing formation.
 func (c *Client) PutFormation(formation *ct.Formation) error {
 	if formation.AppID == "" || formation.ReleaseID == "" {

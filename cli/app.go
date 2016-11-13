@@ -205,42 +205,13 @@ func scaleToZero(appName string, client controller.Client) error {
 	}
 	formation, err := client.GetFormation(appName, release.ID)
 	if err == controller.ErrNotFound {
-		formation = &ct.Formation{
-			AppID:     appName,
-			ReleaseID: release.ID,
-			Processes: make(map[string]int),
-		}
+		return nil
 	} else if err != nil {
 		return err
 	}
-
 	if len(formation.Processes) == 0 {
 		return nil
 	}
-	processes := make(map[string]int)
-	expected := client.ExpectedScalingEvents(formation.Processes, processes, release.Processes, 1)
-
-	if expected.Count() == 0 {
-		return nil
-	}
-
-	watcher, err := client.WatchJobEvents(appName, release.ID)
-	if err != nil {
-		return err
-	}
-	defer watcher.Close()
-
-	// override with empty processes map
-	formation.Processes = processes
-	err = client.PutFormation(formation)
-	if err != nil {
-		return err
-	}
-	err = watcher.WaitFor(expected, scaleTimeout, func(job *ct.Job) error {
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	return nil
+	formation.Processes = nil
+	return client.Scale(formation, nil)
 }
