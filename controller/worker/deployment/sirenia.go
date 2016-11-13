@@ -7,6 +7,7 @@ import (
 	"time"
 
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/controller/worker/types"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/sirenia/client"
 	"github.com/flynn/flynn/pkg/sirenia/state"
@@ -22,7 +23,8 @@ func (d *DeployJob) deploySirenia() (err error) {
 		}
 	}()
 
-	loggedErr := func(e string) error {
+	loggedErr := func(format string, v ...interface{}) error {
+		e := fmt.Sprintf(format, v...)
 		log.Error(e)
 		return errors.New(e)
 	}
@@ -34,7 +36,11 @@ func (d *DeployJob) deploySirenia() (err error) {
 	}
 	// if it's still not set we have a problem.
 	if processType == "" {
-		return fmt.Errorf("unable to determine sirenia process type")
+		return errors.New("unable to determine sirenia process type")
+	}
+	proc, ok := d.newRelease.Processes[processType]
+	if !ok {
+		return errors.New("sirenia process type not present in new release")
 	}
 
 	// if sirenia process type is scaled to 0, skip and deploy non-sirenia processes
@@ -43,13 +49,46 @@ func (d *DeployJob) deploySirenia() (err error) {
 		return d.deployOneByOne()
 	}
 
-	if d.serviceMeta == nil {
+	events := make(chan *discoverd.Event)
+	stream, err := discoverd.NewService(proc.Service).Watch(events)
+	if err != nil {
+		log.Error("error creating service discovery watcher", "service", processType, "err", err)
+		return err
+	}
+	defer stream.Close()
+
+	var serviceMeta *discoverd.ServiceMeta
+loop:
+	for {
+		select {
+		case <-d.stop:
+			return worker.ErrStopped
+		case event, ok := <-events:
+			if !ok {
+				return loggedErr("service event stream closed unexpectedly: %s", stream.Err())
+			}
+			switch event.Kind {
+			case discoverd.EventKindCurrent:
+				break loop
+			case discoverd.EventKindServiceMeta:
+				serviceMeta = event.ServiceMeta
+			case discoverd.EventKindUp:
+				if event.Instance.Meta["FLYNN_RELEASE_ID"] == d.NewReleaseID {
+					return loggedErr("sirenia cluster in unexpected state")
+				}
+			}
+		case <-time.After(5 * time.Second):
+			return loggedErr("timed out waiting for current service event")
+		}
+	}
+
+	if serviceMeta == nil {
 		return loggedErr("missing sirenia cluster state")
 	}
 
 	var state state.State
 	log.Info("decoding sirenia cluster state")
-	if err := json.Unmarshal(d.serviceMeta.Data, &state); err != nil {
+	if err := json.Unmarshal(serviceMeta.Data, &state); err != nil {
 		log.Error("error decoding sirenia cluster state", "err", err)
 		return err
 	}
@@ -62,14 +101,7 @@ func (d *DeployJob) deploySirenia() (err error) {
 		return loggedErr("sirenia cluster in unhealthy state (has no asyncs)")
 	}
 	if 2+len(state.Async) != d.Processes[processType] {
-		return loggedErr(fmt.Sprintf("sirenia cluster in unhealthy state (too few asyncs)"))
-	}
-	if processesEqual(d.newReleaseState, d.Processes) {
-		log.Info("deployment already completed, nothing to do")
-		return nil
-	}
-	if d.newReleaseState[processType] > 0 {
-		return loggedErr("sirenia cluster in unexpected state")
+		return loggedErr("sirenia cluster in unhealthy state (too few asyncs)")
 	}
 
 	stopInstance := func(inst *discoverd.Instance) error {
@@ -87,17 +119,12 @@ func (d *DeployJob) deploySirenia() (err error) {
 			return err
 		}
 		log.Info("waiting for peer to stop")
-		jobEvents := d.ReleaseJobEvents(d.OldReleaseID)
 		for {
 			select {
-			case e := <-jobEvents:
-				if e.Type == JobEventTypeError {
-					return e.Error
+			case event, ok := <-events:
+				if !ok {
+					return loggedErr("service event stream closed unexpectedly: %s", stream.Err())
 				}
-				if e.Type != JobEventTypeDiscoverd {
-					continue
-				}
-				event := e.DiscoverdEvent
 				if event.Kind == discoverd.EventKindDown && event.Instance.ID == inst.ID {
 					d.deployEvents <- ct.DeploymentEvent{
 						ReleaseID: d.OldReleaseID,
@@ -106,7 +133,7 @@ func (d *DeployJob) deploySirenia() (err error) {
 					}
 					return nil
 				}
-			case <-time.After(time.Duration(d.DeployTimeout) * time.Second):
+			case <-time.After(d.timeout):
 				return loggedErr("timed out waiting for peer to stop")
 			}
 		}
@@ -121,29 +148,20 @@ func (d *DeployJob) deploySirenia() (err error) {
 			JobState:  ct.JobStateStarting,
 			JobType:   processType,
 		}
-		d.newReleaseState[processType]++
-		if err := d.client.PutFormation(&ct.Formation{
-			AppID:     d.AppID,
-			ReleaseID: d.NewReleaseID,
-			Processes: d.newReleaseState,
-		}); err != nil {
-			log.Error("error scaling formation up by one", "err", err)
+		d.newFormation.Processes[processType]++
+		if err := d.client.PutFormation(d.newFormation); err != nil {
+			log.Error("error new scaling formation up by one", "err", err)
 			return nil, err
 		}
 		log.Info("waiting for new instance to come up")
 		var inst *discoverd.Instance
-		jobEvents := d.ReleaseJobEvents(d.NewReleaseID)
 	loop:
 		for {
 			select {
-			case e := <-jobEvents:
-				if e.Type == JobEventTypeError {
-					return nil, e.Error
+			case event, ok := <-events:
+				if !ok {
+					return nil, loggedErr("service event stream closed unexpectedly: %s", stream.Err())
 				}
-				if e.Type != JobEventTypeDiscoverd {
-					continue
-				}
-				event := e.DiscoverdEvent
 				if event.Kind == discoverd.EventKindUp &&
 					event.Instance.Meta != nil &&
 					event.Instance.Meta["FLYNN_RELEASE_ID"] == d.NewReleaseID &&
@@ -151,7 +169,7 @@ func (d *DeployJob) deploySirenia() (err error) {
 					inst = event.Instance
 					break loop
 				}
-			case <-time.After(time.Duration(d.DeployTimeout) * time.Second):
+			case <-time.After(d.timeout):
 				return nil, loggedErr("timed out waiting for new instance to come up")
 			}
 		}
@@ -240,54 +258,12 @@ func (d *DeployJob) deploySirenia() (err error) {
 	}
 
 	log.Info("stopping old jobs")
-	d.oldReleaseState[processType] = 0
-	if err := d.client.PutFormation(&ct.Formation{
-		AppID:     d.AppID,
-		ReleaseID: d.OldReleaseID,
-		Processes: d.oldReleaseState,
-	}); err != nil {
+	d.oldFormation.Processes[processType] = 0
+	if err := d.client.Scale(d.oldFormation, d.oldScaleOptions()); err != nil {
 		log.Error("error scaling old formation", "err", err)
 		return err
 	}
 
-	log.Info(fmt.Sprintf("waiting for %d job down events", d.Processes[processType]))
-	actual := 0
-	jobEvents := d.ReleaseJobEvents(d.OldReleaseID)
-loop:
-	for {
-		select {
-		case e := <-jobEvents:
-			if e.Type == JobEventTypeError {
-				return loggedErr(e.Error.Error())
-			}
-			if e.Type != JobEventTypeController {
-				continue
-			}
-			event := e.JobEvent
-			log.Info("got job event", "job_id", event.ID, "type", event.Type, "state", event.State)
-			if event.State == ct.JobStateDown && event.Type == processType {
-				actual++
-				if actual == d.Processes[processType] {
-					break loop
-				}
-			}
-		case <-time.After(time.Duration(d.DeployTimeout) * time.Second):
-			return loggedErr("timed out waiting for job events")
-		}
-	}
-
 	// do a one-by-one deploy for the other process types
 	return d.deployOneByOne()
-}
-
-func processesEqual(a map[string]int, b map[string]int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for typ, countA := range a {
-		if countB, ok := b[typ]; !ok || countA != countB {
-			return false
-		}
-	}
-	return true
 }
