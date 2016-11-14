@@ -343,6 +343,7 @@ func (r *gitRepo) flynn(args ...string) *CmdResult {
 
 func (r *gitRepo) git(args ...string) *CmdResult {
 	cmd := exec.Command("git", args...)
+	cmd.Env = append(os.Environ(), "GIT_TRACE=1", "GIT_TRACE_PACKET=1")
 	cmd.Dir = r.dir
 	return run(r.t, cmd)
 }
